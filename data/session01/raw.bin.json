@@ -1,0 +1,33 @@
+{
+  "format": {
+    "endianness": "little",
+    "struct": "<HBIIHH",
+    "packet_size_bytes": 15,
+    "fields": [
+      "header",
+      "version",
+      "packet_id",
+      "device_timestamp_us",
+      "emg",
+      "crc16"
+    ]
+  },
+  "serial": {
+    "port": "/dev/cu.usbserial-1130",
+    "baudrate": 230400
+  },
+  "lsl": {
+    "name": "SparkFun_MyoWare_EMG",
+    "type": "EMG",
+    "source_id": "sparkfun-myo-001"
+  },
+  "session": {
+    "started_at": "2026-08-06T09:38:22+0700",
+    "ended_at": "2026-08-06T09:41:28+0700",
+    "valid_packets": 272419,
+    "estimated_lost_packets": 35,
+    "bad_crc": 11,
+    "bad_version": 1,
+    "discarded_bytes": 195
+  }
+}
