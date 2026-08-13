@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import struct
 import sys
@@ -104,6 +105,76 @@ class LiveBuffer:
             return list(self.times), list(self.values), self.packets, self.packets / elapsed
 
 
+def minmax_downsample(
+    times: list[float], values: list[float], max_points: int
+) -> tuple[list[float], list[float]]:
+    """Keep min/max in each bin so a dense EMG trace stays readable."""
+    n = len(values)
+    if n <= max_points:
+        return times, values
+    bins = max(1, max_points // 2)
+    xs: list[float] = []
+    ys: list[float] = []
+    for i in range(bins):
+        start = (i * n) // bins
+        end = ((i + 1) * n) // bins
+        if start >= end:
+            continue
+        sl_t = times[start:end]
+        sl_y = values[start:end]
+        min_i = 0
+        max_i = 0
+        min_v = sl_y[0]
+        max_v = sl_y[0]
+        for j, value in enumerate(sl_y):
+            if value < min_v:
+                min_v = value
+                min_i = j
+            if value > max_v:
+                max_v = value
+                max_i = j
+        first, second = (min_i, max_i) if min_i <= max_i else (max_i, min_i)
+        xs.append(sl_t[first])
+        ys.append(sl_y[first])
+        if second != first:
+            xs.append(sl_t[second])
+            ys.append(sl_y[second])
+    return xs, ys
+
+
+def rolling_rms(values: list[float], win: int) -> list[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    win = max(1, min(win, n))
+    out = [0.0] * n
+    sum_sq = 0.0
+    for i, value in enumerate(values):
+        sum_sq += value * value
+        if i >= win:
+            old = values[i - win]
+            sum_sq -= old * old
+        count = win if i >= win else i + 1
+        out[i] = math.sqrt(max(sum_sq, 0.0) / count)
+    return out
+
+
+def y_limits(values: list[float], vref: float | None) -> tuple[float, float]:
+    ymax = max(values)
+    ymin = min(values)
+    if vref is None:
+        step = 200.0
+        pad = max((ymax - ymin) * 0.12, 40.0)
+        hi = math.ceil((ymax + pad) / step) * step
+        lo = 0.0 if ymin >= 0 else math.floor((ymin - pad * 0.25) / step) * step
+        return lo, max(hi, step)
+    step = 0.5
+    pad = max((ymax - ymin) * 0.12, 0.08)
+    hi = math.ceil((ymax + pad) / step) * step
+    lo = 0.0 if ymin >= 0 else math.floor((ymin - pad * 0.25) / step) * step
+    return lo, max(hi, step)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Vẽ EMG realtime từ TCP hub của collect_emg.py."
@@ -176,42 +247,62 @@ def run(args: argparse.Namespace) -> int:
     thread.start()
 
     ylabel = "EMG (V)" if args.vref is not None else "EMG (ADC count)"
-    fig, ax = plt.subplots(figsize=(10, 4))
-    (line,) = ax.plot([], [], lw=0.8, color="#1f77b4")
-    status = ax.text(0.01, 0.95, "", transform=ax.transAxes, va="top")
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    (raw_line,) = ax.plot([], [], lw=0.7, color="#4c78a8", alpha=0.55, label="raw")
+    (env_line,) = ax.plot([], [], lw=1.8, color="#e45756", label="RMS")
+    status = ax.text(
+        0.01,
+        0.97,
+        "",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85},
+    )
     ax.set_xlim(-args.window, 0)
-    if args.vref is None:
-        ax.set_ylim(0, 1024)
-    else:
-        ax.set_ylim(0, args.vref)
+    ax.set_ylim(0, 1200 if args.vref is None else args.vref * 1.2)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
     ax.set_title(f"SparkFun MyoWare  {args.host}:{args.port}")
     ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", framealpha=0.85)
     fig.tight_layout()
+    last_ylim = [0.0, 1200.0 if args.vref is None else args.vref * 1.2]
+
+    def fmt_value(value: float) -> str:
+        return f"{value:.0f} ADC" if args.vref is None else f"{value:.3f} V"
 
     def update(_frame: int):
         times, values, packets, rate = buffer.snapshot()
         if times:
             t0 = times[-1]
-            line.set_data([t - t0 for t in times], values)
-            latest = values[-1]
-            if args.vref is None:
-                latest_text = f"{latest:.0f} ADC"
-            else:
-                latest_text = f"{latest:.3f} V"
+            rel = [t - t0 for t in times]
+            xs, ys = minmax_downsample(rel, values, max_points=1600)
+            raw_line.set_data(xs, ys)
+            rms_win = max(8, int(rate * 0.08))
+            env_line.set_data(rel, rolling_rms(values, rms_win))
+            lo, hi = y_limits(values, args.vref)
+            if (lo, hi) != (last_ylim[0], last_ylim[1]):
+                ax.set_ylim(lo, hi)
+                last_ylim[0], last_ylim[1] = lo, hi
+            vmin = min(values)
+            vmax = max(values)
+            status.set_text(
+                f"{rate:.0f} Hz   {packets} pkt   "
+                f"now {fmt_value(values[-1])}   "
+                f"min {fmt_value(vmin)}   max {fmt_value(vmax)}"
+            )
         else:
-            latest_text = "waiting"
-        status.set_text(f"{rate:.0f} Hz   {packets} pkt   {latest_text}")
+            status.set_text("waiting")
         if stop.is_set() and not thread.is_alive() and packets == 0:
             status.set_text("TCP disconnected / no data")
-        return line, status
+        return raw_line, env_line, status
 
     _anim = FuncAnimation(
         fig,
         update,
         interval=max(int(1000 / args.fps), 10),
-        blit=True,
+        blit=False,
         cache_frame_data=False,
     )
     plt.show()
