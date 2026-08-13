@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -37,15 +39,29 @@ STORED_PACKET_BODY_STRUCT = struct.Struct("<HBIIHQ")
 STORED_PACKET_STRUCT = struct.Struct("<HBIIHQH")
 STORED_PACKET_SIZE = STORED_PACKET_STRUCT.size
 HEADER_BYTES = struct.pack("<H", PACKET_HEADER)
+SERIAL_READ_CHUNK = 8192
+WRITE_BUFFER_PACKETS = 128
+LSL_CHUNK_PACKETS = 32
+
+
+def _crc16_table() -> tuple[int, ...]:
+    table = []
+    for index in range(256):
+        crc = index << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+        table.append(crc)
+    return tuple(table)
+
+
+CRC16_TABLE = _crc16_table()
 
 
 def crc16_ccitt(data: bytes) -> int:
     """Match the CRC-16/CCITT-FALSE implementation used by the firmware."""
     crc = 0xFFFF
     for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+        crc = ((crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ byte) & 0xFF]) & 0xFFFF
     return crc
 
 
@@ -65,6 +81,16 @@ class PacketParser:
         self.bad_crc = 0
         self.bad_version = 0
         self.discarded_bytes = 0
+        self._in_sync = False
+
+    def _reject_candidate(self) -> None:
+        if self._in_sync and len(self.buffer) >= WIRE_PACKET_SIZE:
+            del self.buffer[:WIRE_PACKET_SIZE]
+            self.discarded_bytes += WIRE_PACKET_SIZE
+        else:
+            del self.buffer[0]
+            self.discarded_bytes += 1
+        self._in_sync = False
 
     def feed(self, data: bytes) -> Iterator[EMGPacket]:
         self.buffer.extend(data)
@@ -76,11 +102,13 @@ class PacketParser:
                 discard = max(0, len(self.buffer) - 1)
                 self.discarded_bytes += discard
                 del self.buffer[:discard]
+                self._in_sync = False
                 return
 
             if header_index:
                 self.discarded_bytes += header_index
                 del self.buffer[:header_index]
+                self._in_sync = False
 
             if len(self.buffer) < WIRE_PACKET_SIZE:
                 return
@@ -95,18 +123,62 @@ class PacketParser:
                 # Defensive only: find() above already guarantees this.
                 del self.buffer[0]
                 self.discarded_bytes += 1
+                self._in_sync = False
                 continue
             if version != WIRE_PACKET_VERSION:
                 self.bad_version += 1
-                del self.buffer[0]
+                self._reject_candidate()
                 continue
             if actual_crc != expected_crc:
                 self.bad_crc += 1
-                del self.buffer[0]
+                self._reject_candidate()
                 continue
 
             del self.buffer[:WIRE_PACKET_SIZE]
+            self._in_sync = True
             yield EMGPacket(raw, packet_id, timestamp_us, emg)
+
+
+def open_serial(port: str, baudrate: int) -> serial.Serial:
+    kwargs = {
+        "port": port,
+        "baudrate": baudrate,
+        "bytesize": serial.EIGHTBITS,
+        "parity": serial.PARITY_NONE,
+        "stopbits": serial.STOPBITS_ONE,
+        "timeout": 0.05,
+        "write_timeout": 0,
+        "xonxoff": False,
+        "rtscts": False,
+        "dsrdtr": False,
+    }
+    try:
+        ser = serial.Serial(**kwargs, exclusive=True)
+    except TypeError:
+        ser = serial.Serial(**kwargs)
+    time.sleep(0.4)
+    ser.reset_input_buffer()
+    return ser
+
+
+def serial_reader_loop(
+    ser: serial.Serial,
+    parser: PacketParser,
+    packet_queue: queue.SimpleQueue[EMGPacket],
+    stop: threading.Event,
+) -> None:
+    """Drain the USB-UART buffer continuously so CH340 does not overrun."""
+    while not stop.is_set():
+        try:
+            waiting = ser.in_waiting
+            chunk = ser.read(waiting if waiting else SERIAL_READ_CHUNK)
+        except (serial.SerialException, OSError):
+            stop.set()
+            return
+        if not chunk:
+            continue
+        for packet in parser.feed(chunk):
+            packet_queue.put(packet)
 
 
 class TcpHub:
@@ -143,7 +215,7 @@ class TcpHub:
         while not self._stop.is_set():
             try:
                 conn, addr = self.server.accept()
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):
                 continue
             except OSError:
                 break
@@ -165,7 +237,10 @@ class TcpHub:
                     if n == 0:
                         raise OSError("TCP send returned 0")
                     sent += n
-            except (BlockingIOError, InterruptedError, OSError):
+            except (BlockingIOError, InterruptedError):
+                # The iOS client may not have started reading yet. Keep it.
+                continue
+            except OSError:
                 dropped.append(conn)
                 print(f"\nTCP dropped: {addr[0]}:{addr[1]}", flush=True)
         if dropped:
@@ -199,6 +274,122 @@ class TcpHub:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+
+
+class BonjourAdvertiser:
+    """Advertise the TCP hub so iOS can discover it via Bonjour."""
+
+    service_type = "_sparkfun-emg._tcp"
+    service_name = "SparkFun MyoWare EMG"
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self._process: subprocess.Popen[bytes] | None = None
+        self._zeroconf = None
+        self._info = None
+
+    def start(self) -> str:
+        lan_ip = local_ipv4()
+        if sys.platform == "darwin" and self._start_dns_sd(lan_ip):
+            return f"{self.service_name}.{self.service_type} @ {lan_ip}:{self.port}"
+        if self._start_zeroconf(lan_ip):
+            return f"{self.service_name}.{self.service_type} @ {lan_ip}:{self.port}"
+        return (
+            f"unavailable; iOS can still connect to {lan_ip}:{self.port} "
+            "if Local Network permission is allowed"
+        )
+
+    def _start_dns_sd(self, lan_ip: str) -> bool:
+        try:
+            self._process = subprocess.Popen(
+                [
+                    "dns-sd",
+                    "-P",
+                    self.service_name,
+                    self.service_type,
+                    "local.",
+                    str(self.port),
+                    "sparkfun-emg.local",
+                    lan_ip,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return self._process.poll() is None
+        except OSError:
+            self._process = None
+            return False
+
+    def _start_zeroconf(self, lan_ip: str) -> bool:
+        try:
+            from zeroconf import ServiceInfo, Zeroconf
+        except ImportError:
+            return False
+        try:
+            info = ServiceInfo(
+                f"{self.service_type}.local.",
+                f"{self.service_name}.{self.service_type}.local.",
+                addresses=[socket.inet_aton(lan_ip)],
+                port=self.port,
+                properties={"path": "/", "source": "sparkfun-myo"},
+            )
+            zeroconf = Zeroconf()
+            zeroconf.register_service(info)
+            self._info = info
+            self._zeroconf = zeroconf
+            return True
+        except OSError:
+            return False
+
+    def close(self) -> None:
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = None
+        if self._zeroconf is not None:
+            try:
+                if self._info is not None:
+                    self._zeroconf.unregister_service(self._info)
+                self._zeroconf.close()
+            except OSError:
+                pass
+            self._zeroconf = None
+            self._info = None
+
+
+def local_ipv4() -> str:
+    candidates: list[str] = []
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        if _is_lan_ipv4(ip):
+            candidates.append(ip)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if _is_lan_ipv4(ip) and ip not in candidates:
+                candidates.append(ip)
+    except OSError:
+        pass
+
+    return candidates[0] if candidates else "127.0.0.1"
+
+
+def _is_lan_ipv4(ip: str) -> bool:
+    return not (
+        ip.startswith("127.")
+        or ip.startswith("169.254.")
+        or ip.startswith("0.")
+    )
 
 
 def available_ports() -> list[str]:
@@ -404,11 +595,11 @@ def run(args: argparse.Namespace) -> int:
 
         outlet = create_lsl_outlet(args.source_id)
     tcp_hub = None if args.no_tcp else TcpHub(args.tcp_host, args.tcp_port)
-    stop_requested = False
+    bonjour = None
+    stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stop_requested
-        stop_requested = True
+        stop_event.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -419,6 +610,10 @@ def run(args: argparse.Namespace) -> int:
     started_monotonic = time.monotonic()
     last_report = started_monotonic
     last_flush = started_monotonic
+    packet_queue: queue.SimpleQueue[EMGPacket] = queue.SimpleQueue()
+    write_buf = bytearray()
+    lsl_samples: list[list[int]] = []
+    lsl_stamps: list[float] = []
 
     print(f"Serial: {port} @ {args.baud}")
     print(f"Data:   {args.output}")
@@ -429,71 +624,116 @@ def run(args: argparse.Namespace) -> int:
     if tcp_hub is None:
         print("TCP:    tắt")
     else:
-        print(f"TCP:    {args.tcp_host}:{args.tcp_port}")
+        lan_ip = local_ipv4()
+        print(f"TCP:    {args.tcp_host}:{args.tcp_port} (LAN {lan_ip}:{args.tcp_port})")
         tcp_hub.start()
+        bonjour = BonjourAdvertiser(args.tcp_port)
+        print(f"Bonjour:{bonjour.start()}")
     print("Đang thu thập; nhấn Ctrl+C để dừng.")
 
+    def flush_outputs(output, force: bool = False) -> None:
+        if write_buf and (
+            force or len(write_buf) >= STORED_PACKET_SIZE * WRITE_BUFFER_PACKETS
+        ):
+            output.write(write_buf)
+            write_buf.clear()
+        if outlet is not None and lsl_samples and (force or len(lsl_samples) >= LSL_CHUNK_PACKETS):
+            outlet.push_chunk(lsl_samples, lsl_stamps)
+            lsl_samples.clear()
+            lsl_stamps.clear()
+
+    def handle_packet(packet: EMGPacket) -> None:
+        nonlocal packets, lost_packets, previous_packet_id
+        utc_timestamp_s = int(time.time())
+        stored_body = STORED_PACKET_BODY_STRUCT.pack(
+            PACKET_HEADER,
+            STORED_PACKET_VERSION,
+            packet.packet_id,
+            packet.device_timestamp_us,
+            packet.emg,
+            utc_timestamp_s,
+        )
+        stored_packet = stored_body + struct.pack("<H", crc16_ccitt(stored_body))
+        write_buf.extend(stored_packet)
+        if tcp_hub is not None:
+            tcp_hub.broadcast(stored_packet)
+        if outlet is not None and lsl_clock is not None:
+            lsl_samples.append(
+                [
+                    packet.packet_id,
+                    packet.device_timestamp_us,
+                    packet.emg,
+                    utc_timestamp_s,
+                ]
+            )
+            lsl_stamps.append(lsl_clock())
+        packets += 1
+        if previous_packet_id is not None:
+            gap = (packet.packet_id - previous_packet_id) & 0xFFFFFFFF
+            if 1 < gap < 0x80000000:
+                lost_packets += gap - 1
+        previous_packet_id = packet.packet_id
+
     try:
-        with serial.Serial(port, args.baud, timeout=0.2) as ser, args.output.open(
-            "wb"
-        ) as output:
-            ser.reset_input_buffer()
-            while not stop_requested:
+        with open_serial(port, args.baud) as ser, args.output.open("wb") as output:
+            reader = threading.Thread(
+                target=serial_reader_loop,
+                args=(ser, parser, packet_queue, stop_event),
+                name="serial-reader",
+                daemon=True,
+            )
+            reader.start()
+            while not stop_event.is_set():
                 now = time.monotonic()
                 if args.duration is not None and now - started_monotonic >= args.duration:
+                    stop_event.set()
                     break
 
-                chunk = ser.read(max(WIRE_PACKET_SIZE, ser.in_waiting))
-                for packet in parser.feed(chunk):
-                    utc_timestamp_s = int(time.time())
-                    stored_body = STORED_PACKET_BODY_STRUCT.pack(
-                        PACKET_HEADER,
-                        STORED_PACKET_VERSION,
-                        packet.packet_id,
-                        packet.device_timestamp_us,
-                        packet.emg,
-                        utc_timestamp_s,
-                    )
-                    stored_packet = stored_body + struct.pack(
-                        "<H", crc16_ccitt(stored_body)
-                    )
-                    output.write(stored_packet)
-                    if tcp_hub is not None:
-                        tcp_hub.broadcast(stored_packet)
-                    if outlet is not None and lsl_clock is not None:
-                        outlet.push_sample(
-                            [
-                                packet.packet_id,
-                                packet.device_timestamp_us,
-                                packet.emg,
-                                utc_timestamp_s,
-                            ],
-                            lsl_clock(),
+                drained = 0
+                while drained < 256:
+                    try:
+                        packet = (
+                            packet_queue.get(timeout=0.05)
+                            if drained == 0
+                            else packet_queue.get_nowait()
                         )
-                    packets += 1
+                    except queue.Empty:
+                        break
+                    handle_packet(packet)
+                    drained += 1
 
-                    if previous_packet_id is not None:
-                        gap = (packet.packet_id - previous_packet_id) & 0xFFFFFFFF
-                        if 1 < gap < 0x80000000:
-                            lost_packets += gap - 1
-                    previous_packet_id = packet.packet_id
-
+                flush_outputs(output)
                 now = time.monotonic()
                 if now - last_flush >= args.flush_interval:
+                    flush_outputs(output, force=True)
                     output.flush()
                     last_flush = now
                 if not args.quiet and now - last_report >= 1.0:
                     elapsed = max(now - started_monotonic, 1e-9)
                     tcp_clients = 0 if tcp_hub is None else tcp_hub.client_count
+                    seen = packets + lost_packets
+                    loss_pct = (100.0 * lost_packets / seen) if seen else 0.0
                     print(
                         f"\rPackets: {packets} | Rate: {packets / elapsed:.1f} Hz "
-                        f"| Lost: {lost_packets} | CRC errors: {parser.bad_crc} "
+                        f"| Lost: {lost_packets} ({loss_pct:.3f}%) "
+                        f"| CRC errors: {parser.bad_crc} "
                         f"| TCP clients: {tcp_clients}",
                         end="",
                         flush=True,
                     )
                     last_report = now
+            stop_event.set()
+            while True:
+                try:
+                    handle_packet(packet_queue.get_nowait())
+                except queue.Empty:
+                    break
+            flush_outputs(output, force=True)
+            output.flush()
+            reader.join(timeout=1.0)
     finally:
+        if bonjour is not None:
+            bonjour.close()
         if tcp_hub is not None:
             tcp_hub.close()
         write_metadata(

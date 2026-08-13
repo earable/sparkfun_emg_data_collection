@@ -23,18 +23,25 @@ Thiết bị cùng mạng LAN có thể nhận data qua TCP, không cần cài L
 
 ## Arduino Firmware (packet dây v1, 15 byte)
 
-Firmware gửi liên tục trên Serial `230400` baud:
+Firmware lấy mẫu **cố định 1000 Hz** rồi gửi trên Serial `230400` baud.
+Không chạy `loop()` hết tốc lực: packet 15 byte chiếm ~150 bit, trần lý thuyết
+khoảng 1536 Hz; ~1480 Hz trước đây sát trần nên CH340 dễ overrun.
+
+MyoWare RAW có băng thông ~20–500 Hz nên Nyquist tối thiểu là 1000 Hz. ENV
+đã lọc 3.6 Hz, 100–200 Hz là đủ, nhưng 1000 Hz vẫn an toàn cho cả hai và
+còn ~35% headroom UART. Đổi `SAMPLE_HZ` nếu cần.
 
 ```cpp
 #include <Arduino.h>
 
 #define EMG_PIN A0
 #define BAUDRATE 230400
+#define SAMPLE_HZ 1000
 #define PACKET_HEADER 0xAA55
 #define PACKET_VERSION 1
 
-#pragma pack(push,1)
-struct EMGPacket{
+#pragma pack(push, 1)
+struct EMGPacket {
     uint16_t header;
     uint8_t version;
     uint32_t packetID;
@@ -44,33 +51,47 @@ struct EMGPacket{
 };
 #pragma pack(pop)
 
-EMGPacket packet;
-uint32_t packetCounter=0;
+static EMGPacket packet;
+static uint32_t packetCounter = 0;
+static uint32_t nextSampleUs = 0;
+static const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_HZ;
 
-uint16_t crc16(const uint8_t *data,uint16_t len){
-    uint16_t crc=0xFFFF;
-    while(len--){
-        crc ^= (*data++)<<8;
-        for(uint8_t i=0;i<8;i++)
-            crc = (crc & 0x8000)?((crc<<1)^0x1021):(crc<<1);
+uint16_t crc16(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    while (len--) {
+        crc ^= (*data++) << 8;
+        for (uint8_t i = 0; i < 8; i++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
+        }
     }
     return crc;
 }
 
-void setup(){
+void setup() {
     Serial.begin(BAUDRATE);
     analogReference(DEFAULT);
-    pinMode(EMG_PIN,INPUT);
-    packet.header=PACKET_HEADER;
-    packet.version=PACKET_VERSION;
+    pinMode(EMG_PIN, INPUT);
+    packet.header = PACKET_HEADER;
+    packet.version = PACKET_VERSION;
+    nextSampleUs = micros();
 }
 
-void loop(){
-    packet.packetID=packetCounter++;
-    packet.timestamp=micros();
-    packet.emg=analogRead(EMG_PIN);
-    packet.crc=crc16((uint8_t*)&packet,sizeof(packet)-sizeof(packet.crc));
-    Serial.write((uint8_t*)&packet,sizeof(packet));
+void loop() {
+    uint32_t now = micros();
+    if ((int32_t)(now - nextSampleUs) < 0) {
+        return;
+    }
+    if ((int32_t)(now - nextSampleUs) > (int32_t)SAMPLE_PERIOD_US) {
+        nextSampleUs = now;
+    }
+    nextSampleUs += SAMPLE_PERIOD_US;
+
+    packet.packetID = packetCounter++;
+    packet.timestamp = now;
+    packet.emg = analogRead(EMG_PIN);
+    packet.crc = crc16((uint8_t *)&packet, sizeof(packet) - sizeof(packet.crc));
+    Serial.write((uint8_t *)&packet, sizeof(packet));
 }
 ```
 
