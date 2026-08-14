@@ -99,6 +99,14 @@ class LiveBuffer:
                 self.times.popleft()
                 self.values.popleft()
 
+    def reset_timeline(self) -> None:
+        with self.lock:
+            self.times.clear()
+            self.values.clear()
+            self._wraps = 0
+            self._prev_ts = None
+            self._origin_us = None
+
     def snapshot(self) -> tuple[list[float], list[float], int, float]:
         with self.lock:
             elapsed = max(time.monotonic() - self.started, 1e-9)
@@ -209,24 +217,41 @@ def receiver_loop(
     buffer: LiveBuffer,
     vref: float | None,
     stop: threading.Event,
+    conn_state: dict[str, str],
 ) -> None:
-    parser = PacketParser()
-    sock = socket.create_connection((host, port), timeout=5.0)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.settimeout(0.2)
-    try:
-        while not stop.is_set():
+    while not stop.is_set():
+        conn_state["status"] = "connecting"
+        try:
+            sock = socket.create_connection((host, port), timeout=3.0)
+        except OSError:
+            conn_state["status"] = "reconnecting"
+            stop.wait(1.0)
+            continue
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(0.2)
+        parser = PacketParser()
+        buffer.reset_timeline()
+        conn_state["status"] = "connected"
+        try:
+            while not stop.is_set():
+                try:
+                    chunk = sock.recv(4096)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                for _packet_id, timestamp_us, emg in parser.feed(chunk):
+                    buffer.add(timestamp_us, emg, vref)
+        finally:
             try:
-                chunk = sock.recv(4096)
-            except TimeoutError:
-                continue
-            if not chunk:
-                break
-            for _packet_id, timestamp_us, emg in parser.feed(chunk):
-                buffer.add(timestamp_us, emg, vref)
-    finally:
-        sock.close()
-        stop.set()
+                sock.close()
+            except OSError:
+                pass
+        if not stop.is_set():
+            conn_state["status"] = "reconnecting"
+            stop.wait(0.5)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -239,9 +264,10 @@ def run(args: argparse.Namespace) -> int:
 
     buffer = LiveBuffer(args.window)
     stop = threading.Event()
+    conn_state = {"status": "connecting"}
     thread = threading.Thread(
         target=receiver_loop,
-        args=(args.host, args.port, buffer, args.vref, stop),
+        args=(args.host, args.port, buffer, args.vref, stop, conn_state),
         daemon=True,
     )
     thread.start()
@@ -290,12 +316,11 @@ def run(args: argparse.Namespace) -> int:
             status.set_text(
                 f"{rate:.0f} Hz   {packets} pkt   "
                 f"now {fmt_value(values[-1])}   "
-                f"min {fmt_value(vmin)}   max {fmt_value(vmax)}"
+                f"min {fmt_value(vmin)}   max {fmt_value(vmax)}   "
+                f"[{conn_state['status']}]"
             )
         else:
-            status.set_text("waiting")
-        if stop.is_set() and not thread.is_alive() and packets == 0:
-            status.set_text("TCP disconnected / no data")
+            status.set_text(f"TCP {conn_state['status']}   {args.host}:{args.port}")
         return raw_line, env_line, status
 
     _anim = FuncAnimation(

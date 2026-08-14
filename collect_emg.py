@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import signal
 import socket
@@ -44,6 +45,23 @@ SERIAL_READ_CHUNK = 8192
 WRITE_BUFFER_PACKETS = 128
 LSL_CHUNK_PACKETS = 32
 SERIAL_RECONNECT_S = 0.5
+TCP_LINGER_RST = struct.pack("ii", 1, 0)
+
+
+def close_tcp_socket(sock: socket.socket) -> None:
+    """RST so receivers notice the drop immediately and can reconnect."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, TCP_LINGER_RST)
+    except OSError:
+        pass
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def _crc16_table() -> tuple[int, ...]:
@@ -266,12 +284,24 @@ class TcpHub:
             return len(self._clients)
 
     def start(self) -> None:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((self.host, self.port))
+        last_error: OSError | None = None
+        for attempt in range(10):
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server.bind((self.host, self.port))
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                server.close()
+                time.sleep(0.2)
+        if last_error is not None:
+            raise last_error
         server.listen(16)
         server.settimeout(0.5)
         self.server = server
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self._accept_loop, name="tcp-hub", daemon=True
         )
@@ -287,6 +317,7 @@ class TcpHub:
             except OSError:
                 break
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             conn.setblocking(False)
             with self._lock:
                 self._clients[conn] = addr
@@ -317,27 +348,18 @@ class TcpHub:
         with self._lock:
             for conn in sockets:
                 self._clients.pop(conn, None)
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                close_tcp_socket(conn)
 
     def close(self) -> None:
         self._stop.set()
         if self.server is not None:
-            try:
-                self.server.close()
-            except OSError:
-                pass
+            close_tcp_socket(self.server)
             self.server = None
         with self._lock:
             clients = list(self._clients)
             self._clients.clear()
         for conn in clients:
-            try:
-                conn.close()
-            except OSError:
-                pass
+            close_tcp_socket(conn)
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
@@ -356,6 +378,7 @@ class BonjourAdvertiser:
         self._info = None
 
     def start(self) -> str:
+        self._kill_stale_dns_sd()
         lan_ip = local_ipv4()
         if sys.platform == "darwin" and self._start_dns_sd(lan_ip):
             return f"{self.service_name}.{self.service_type} @ {lan_ip}:{self.port}"
@@ -365,6 +388,28 @@ class BonjourAdvertiser:
             f"unavailable; iOS can still connect to {lan_ip}:{self.port} "
             "if Local Network permission is allowed"
         )
+
+    def _kill_stale_dns_sd(self) -> None:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "dns-sd .*-P.*_sparkfun-emg._tcp"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return
+        for pid_text in result.stdout.split():
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                pass
+        if result.stdout.strip():
+            time.sleep(0.4)
 
     def _start_dns_sd(self, lan_ip: str) -> bool:
         try:
@@ -381,6 +426,7 @@ class BonjourAdvertiser:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             return self._process.poll() is None
         except OSError:
@@ -410,11 +456,16 @@ class BonjourAdvertiser:
 
     def close(self) -> None:
         if self._process is not None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+            if self._process.poll() is None:
+                self._process.send_signal(signal.SIGINT)
+                try:
+                    self._process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    try:
+                        self._process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
             self._process = None
         if self._zeroconf is not None:
             try:
@@ -909,10 +960,14 @@ def run(args: argparse.Namespace) -> int:
                 )
             )
             pending_usb_start_unix = None
-        if bonjour is not None:
-            bonjour.close()
         if tcp_hub is not None:
             tcp_hub.close()
+            tcp_hub = None
+        if bonjour is not None:
+            bonjour.close()
+            bonjour = None
+        if outlet is not None:
+            outlet = None
         write_metadata(
             metadata_path,
             port=port,

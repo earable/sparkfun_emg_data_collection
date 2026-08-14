@@ -171,41 +171,69 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"TCP:  {args.host}:{args.port}")
     print(f"Data: {args.output}")
-    print("Đang nhận; nhấn Ctrl+C để dừng.")
+    print("Đang nhận; nhấn Ctrl+C để dừng. Mất kết nối sẽ tự reconnect.")
 
     try:
-        with socket.create_connection((args.host, args.port), timeout=5.0) as sock, (
-            args.output.open("wb")
-        ) as output:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(0.2)
+        with args.output.open("wb") as output:
             while not stop_requested:
                 now = time.monotonic()
                 if args.duration is not None and now - started_monotonic >= args.duration:
                     break
                 try:
-                    chunk = sock.recv(4096)
-                except TimeoutError:
+                    sock = socket.create_connection((args.host, args.port), timeout=3.0)
+                except OSError:
+                    if not args.quiet:
+                        print("\rTCP reconnecting...", end="", flush=True)
+                    time.sleep(1.0)
                     continue
-                if not chunk:
-                    raise RuntimeError("TCP server đã đóng kết nối.")
-                for packet in parser.feed(chunk):
-                    output.write(packet)
-                    sample_count += 1
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(0.2)
+                parser.buffer.clear()
+                if not args.quiet:
+                    print(f"\nTCP connected: {args.host}:{args.port}", flush=True)
+                try:
+                    while not stop_requested:
+                        now = time.monotonic()
+                        if (
+                            args.duration is not None
+                            and now - started_monotonic >= args.duration
+                        ):
+                            stop_requested = True
+                            break
+                        try:
+                            chunk = sock.recv(4096)
+                        except TimeoutError:
+                            continue
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        for packet in parser.feed(chunk):
+                            output.write(packet)
+                            sample_count += 1
 
-                now = time.monotonic()
-                if now - last_flush >= args.flush_interval:
-                    output.flush()
-                    last_flush = now
-                if not args.quiet and now - last_report >= 1.0:
-                    elapsed = max(now - started_monotonic, 1e-9)
-                    print(
-                        f"\rSamples: {sample_count} | "
-                        f"Rate: {sample_count / elapsed:.1f} Hz",
-                        end="",
-                        flush=True,
-                    )
-                    last_report = now
+                        now = time.monotonic()
+                        if now - last_flush >= args.flush_interval:
+                            output.flush()
+                            last_flush = now
+                        if not args.quiet and now - last_report >= 1.0:
+                            elapsed = max(now - started_monotonic, 1e-9)
+                            print(
+                                f"\rSamples: {sample_count} | "
+                                f"Rate: {sample_count / elapsed:.1f} Hz",
+                                end="",
+                                flush=True,
+                            )
+                            last_report = now
+                finally:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                if not stop_requested:
+                    if not args.quiet:
+                        print("\nTCP disconnected; reconnecting...", flush=True)
+                    time.sleep(0.5)
     finally:
         write_metadata(
             metadata_path,
