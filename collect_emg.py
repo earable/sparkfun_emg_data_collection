@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -42,6 +43,7 @@ HEADER_BYTES = struct.pack("<H", PACKET_HEADER)
 SERIAL_READ_CHUNK = 8192
 WRITE_BUFFER_PACKETS = 128
 LSL_CHUNK_PACKETS = 32
+SERIAL_RECONNECT_S = 0.5
 
 
 def _crc16_table() -> tuple[int, ...]:
@@ -81,6 +83,10 @@ class PacketParser:
         self.bad_crc = 0
         self.bad_version = 0
         self.discarded_bytes = 0
+        self._in_sync = False
+
+    def reset(self) -> None:
+        self.buffer.clear()
         self._in_sync = False
 
     def _reject_candidate(self) -> None:
@@ -161,24 +167,85 @@ def open_serial(port: str, baudrate: int) -> serial.Serial:
     return ser
 
 
+def find_serial_port(preferred: str) -> str | None:
+    ports = available_ports()
+    if preferred in ports:
+        return preferred
+    usb_ports = [
+        port
+        for port in ports
+        if "usb" in port.lower() or "acm" in port.lower()
+    ]
+    if len(usb_ports) == 1:
+        return usb_ports[0]
+    return None
+
+
 def serial_reader_loop(
-    ser: serial.Serial,
+    preferred_port: str,
+    baudrate: int,
     parser: PacketParser,
     packet_queue: queue.SimpleQueue[EMGPacket],
     stop: threading.Event,
+    usb_state: dict[str, object],
 ) -> None:
-    """Drain the USB-UART buffer continuously so CH340 does not overrun."""
-    while not stop.is_set():
-        try:
-            waiting = ser.in_waiting
-            chunk = ser.read(waiting if waiting else SERIAL_READ_CHUNK)
-        except (serial.SerialException, OSError):
-            stop.set()
-            return
-        if not chunk:
-            continue
-        for packet in parser.feed(chunk):
-            packet_queue.put(packet)
+    """Read USB continuously; reopen the port if the cable is unplugged."""
+    ser: serial.Serial | None = None
+    last_wait_log = 0.0
+    try:
+        while not stop.is_set():
+            if ser is None:
+                target = find_serial_port(preferred_port)
+                if target is None:
+                    usb_state["connected"] = False
+                    now = time.monotonic()
+                    if now - last_wait_log >= 2.0:
+                        print(
+                            f"\nUSB disconnected; waiting for {preferred_port}",
+                            flush=True,
+                        )
+                        last_wait_log = now
+                    stop.wait(SERIAL_RECONNECT_S)
+                    continue
+                try:
+                    ser = open_serial(target, baudrate)
+                except (serial.SerialException, OSError) as exc:
+                    usb_state["connected"] = False
+                    now = time.monotonic()
+                    if now - last_wait_log >= 2.0:
+                        print(f"\nUSB waiting ({target}): {exc}", flush=True)
+                        last_wait_log = now
+                    stop.wait(SERIAL_RECONNECT_S)
+                    continue
+                parser.reset()
+                usb_state["port"] = target
+                usb_state["generation"] = int(usb_state["generation"]) + 1
+                usb_state["connected"] = True
+                print(f"\nUSB connected: {target}", flush=True)
+            try:
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting if waiting else SERIAL_READ_CHUNK)
+            except (serial.SerialException, OSError):
+                print("\nUSB disconnected; waiting to reconnect...", flush=True)
+                usb_state["connected"] = False
+                parser.reset()
+                try:
+                    ser.close()
+                except OSError:
+                    pass
+                ser = None
+                last_wait_log = time.monotonic()
+                continue
+            if not chunk:
+                continue
+            for packet in parser.feed(chunk):
+                packet_queue.put(packet)
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except OSError:
+                pass
 
 
 class TcpHub:
@@ -452,6 +519,30 @@ def create_lsl_outlet(source_id: str):
     return StreamOutlet(info)
 
 
+def utc_timestamp_text(unix_s: float) -> str:
+    moment = datetime.fromtimestamp(unix_s).astimezone()
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + moment.strftime("%z")
+
+
+def make_lost_interval(
+    *,
+    start_unix: float,
+    end_unix: float,
+    reason: str,
+    lost_packets: int | None,
+    start_packet_id: int | None,
+    end_packet_id: int | None,
+) -> dict[str, object]:
+    return {
+        "start_timestamp": utc_timestamp_text(start_unix),
+        "end_timestamp": utc_timestamp_text(end_unix),
+        "lost_packets": lost_packets,
+        "reason": reason,
+        "start_packet_id": start_packet_id,
+        "end_packet_id": end_packet_id,
+    }
+
+
 def write_metadata(
     path: Path,
     *,
@@ -461,6 +552,7 @@ def write_metadata(
     started_at: str,
     packets: int,
     lost_packets: int,
+    lost_intervals: list[dict[str, object]],
     parser: PacketParser,
     tcp_endpoint: str | None,
 ) -> None:
@@ -505,6 +597,7 @@ def write_metadata(
             "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "valid_packets": packets,
             "estimated_lost_packets": lost_packets,
+            "lost_intervals": lost_intervals,
             "bad_crc": parser.bad_crc,
             "bad_version": parser.bad_version,
             "discarded_bytes": parser.discarded_bytes,
@@ -606,7 +699,12 @@ def run(args: argparse.Namespace) -> int:
 
     packets = 0
     lost_packets = 0
+    lost_intervals: list[dict[str, object]] = []
     previous_packet_id: int | None = None
+    last_packet_unix: float | None = None
+    last_packet_id: int | None = None
+    pending_usb_start_unix: float | None = None
+    pending_usb_start_packet_id: int | None = None
     started_monotonic = time.monotonic()
     last_report = started_monotonic
     last_flush = started_monotonic
@@ -614,6 +712,12 @@ def run(args: argparse.Namespace) -> int:
     write_buf = bytearray()
     lsl_samples: list[list[int]] = []
     lsl_stamps: list[float] = []
+    usb_state: dict[str, object] = {
+        "connected": False,
+        "port": port,
+        "generation": 0,
+    }
+    last_usb_generation = 0
 
     print(f"Serial: {port} @ {args.baud}")
     print(f"Data:   {args.output}")
@@ -644,7 +748,10 @@ def run(args: argparse.Namespace) -> int:
 
     def handle_packet(packet: EMGPacket) -> None:
         nonlocal packets, lost_packets, previous_packet_id
-        utc_timestamp_s = int(time.time())
+        nonlocal last_packet_unix, last_packet_id
+        nonlocal pending_usb_start_unix, pending_usb_start_packet_id
+        utc_now = time.time()
+        utc_timestamp_s = int(utc_now)
         stored_body = STORED_PACKET_BODY_STRUCT.pack(
             PACKET_HEADER,
             STORED_PACKET_VERSION,
@@ -668,17 +775,52 @@ def run(args: argparse.Namespace) -> int:
             )
             lsl_stamps.append(lsl_clock())
         packets += 1
+        if pending_usb_start_unix is not None:
+            lost_intervals.append(
+                make_lost_interval(
+                    start_unix=pending_usb_start_unix,
+                    end_unix=utc_now,
+                    reason="usb_disconnect",
+                    lost_packets=None,
+                    start_packet_id=pending_usb_start_packet_id,
+                    end_packet_id=packet.packet_id,
+                )
+            )
+            pending_usb_start_unix = None
+            pending_usb_start_packet_id = None
         if previous_packet_id is not None:
             gap = (packet.packet_id - previous_packet_id) & 0xFFFFFFFF
             if 1 < gap < 0x80000000:
-                lost_packets += gap - 1
+                lost = gap - 1
+                lost_packets += lost
+                lost_intervals.append(
+                    make_lost_interval(
+                        start_unix=(
+                            last_packet_unix if last_packet_unix is not None else utc_now
+                        ),
+                        end_unix=utc_now,
+                        reason="packet_gap",
+                        lost_packets=lost,
+                        start_packet_id=previous_packet_id,
+                        end_packet_id=packet.packet_id,
+                    )
+                )
         previous_packet_id = packet.packet_id
+        last_packet_unix = utc_now
+        last_packet_id = packet.packet_id
 
     try:
-        with open_serial(port, args.baud) as ser, args.output.open("wb") as output:
+        with args.output.open("wb") as output:
             reader = threading.Thread(
                 target=serial_reader_loop,
-                args=(ser, parser, packet_queue, stop_event),
+                args=(
+                    port,
+                    args.baud,
+                    parser,
+                    packet_queue,
+                    stop_event,
+                    usb_state,
+                ),
                 name="serial-reader",
                 daemon=True,
             )
@@ -688,6 +830,27 @@ def run(args: argparse.Namespace) -> int:
                 if args.duration is not None and now - started_monotonic >= args.duration:
                     stop_event.set()
                     break
+
+                usb_generation = int(usb_state["generation"])
+                if usb_generation != last_usb_generation:
+                    if last_usb_generation != 0 and pending_usb_start_unix is None:
+                        pending_usb_start_unix = (
+                            last_packet_unix
+                            if last_packet_unix is not None
+                            else time.time()
+                        )
+                        pending_usb_start_packet_id = last_packet_id
+                    previous_packet_id = None
+                    last_usb_generation = usb_generation
+                elif (
+                    last_usb_generation != 0
+                    and not usb_state["connected"]
+                    and pending_usb_start_unix is None
+                ):
+                    pending_usb_start_unix = (
+                        last_packet_unix if last_packet_unix is not None else time.time()
+                    )
+                    pending_usb_start_packet_id = last_packet_id
 
                 drained = 0
                 while drained < 256:
@@ -713,10 +876,12 @@ def run(args: argparse.Namespace) -> int:
                     tcp_clients = 0 if tcp_hub is None else tcp_hub.client_count
                     seen = packets + lost_packets
                     loss_pct = (100.0 * lost_packets / seen) if seen else 0.0
+                    usb_text = "ok" if usb_state["connected"] else "disconnected"
                     print(
                         f"\rPackets: {packets} | Rate: {packets / elapsed:.1f} Hz "
                         f"| Lost: {lost_packets} ({loss_pct:.3f}%) "
                         f"| CRC errors: {parser.bad_crc} "
+                        f"| USB: {usb_text} "
                         f"| TCP clients: {tcp_clients}",
                         end="",
                         flush=True,
@@ -732,6 +897,18 @@ def run(args: argparse.Namespace) -> int:
             output.flush()
             reader.join(timeout=1.0)
     finally:
+        if pending_usb_start_unix is not None:
+            lost_intervals.append(
+                make_lost_interval(
+                    start_unix=pending_usb_start_unix,
+                    end_unix=time.time(),
+                    reason="usb_disconnect",
+                    lost_packets=None,
+                    start_packet_id=pending_usb_start_packet_id,
+                    end_packet_id=None,
+                )
+            )
+            pending_usb_start_unix = None
         if bonjour is not None:
             bonjour.close()
         if tcp_hub is not None:
@@ -744,6 +921,7 @@ def run(args: argparse.Namespace) -> int:
             started_at=started_at,
             packets=packets,
             lost_packets=lost_packets,
+            lost_intervals=lost_intervals,
             parser=parser,
             tcp_endpoint=None
             if args.no_tcp
@@ -754,7 +932,8 @@ def run(args: argparse.Namespace) -> int:
         print()
     print(
         f"Đã lưu {packets} packet ({packets * STORED_PACKET_SIZE} byte); "
-        f"ước tính mất {lost_packets} packet."
+        f"ước tính mất {lost_packets} packet "
+        f"({len(lost_intervals)} khoảng)."
     )
     print(f"Metadata: {metadata_path}")
     return 0
