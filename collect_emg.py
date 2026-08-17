@@ -46,6 +46,8 @@ WRITE_BUFFER_PACKETS = 128
 LSL_CHUNK_PACKETS = 32
 SERIAL_RECONNECT_S = 0.5
 TCP_LINGER_RST = struct.pack("ii", 1, 0)
+TCP_SEND_QUEUE_MAX = 4000
+TCP_SEND_BATCH = 64
 
 
 def close_tcp_socket(sock: socket.socket) -> None:
@@ -276,7 +278,9 @@ class TcpHub:
         self._clients: dict[socket.socket, tuple[str, int]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._accept_thread: threading.Thread | None = None
+        self._send_thread: threading.Thread | None = None
+        self._outgoing: queue.Queue[bytes] = queue.Queue(maxsize=TCP_SEND_QUEUE_MAX)
 
     @property
     def client_count(self) -> int:
@@ -285,7 +289,7 @@ class TcpHub:
 
     def start(self) -> None:
         last_error: OSError | None = None
-        for attempt in range(10):
+        for _attempt in range(10):
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -302,10 +306,14 @@ class TcpHub:
         server.settimeout(0.5)
         self.server = server
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._accept_loop, name="tcp-hub", daemon=True
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop, name="tcp-accept", daemon=True
         )
-        self._thread.start()
+        self._send_thread = threading.Thread(
+            target=self._send_loop, name="tcp-send", daemon=True
+        )
+        self._accept_thread.start()
+        self._send_thread.start()
 
     def _accept_loop(self) -> None:
         assert self.server is not None
@@ -318,31 +326,49 @@ class TcpHub:
                 break
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            conn.setblocking(False)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+            conn.settimeout(0.2)
             with self._lock:
                 self._clients[conn] = addr
             print(f"\nTCP connected: {addr[0]}:{addr[1]}", flush=True)
 
     def broadcast(self, payload: bytes) -> None:
-        with self._lock:
-            clients = list(self._clients.items())
-        dropped: list[socket.socket] = []
-        for conn, addr in clients:
+        try:
+            self._outgoing.put_nowait(payload)
+        except queue.Full:
             try:
-                sent = 0
-                while sent < len(payload):
-                    n = conn.send(payload[sent:])
-                    if n == 0:
-                        raise OSError("TCP send returned 0")
-                    sent += n
-            except (BlockingIOError, InterruptedError):
-                # The iOS client may not have started reading yet. Keep it.
+                self._outgoing.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._outgoing.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    def _send_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                first = self._outgoing.get(timeout=0.2)
+            except queue.Empty:
                 continue
-            except OSError:
-                dropped.append(conn)
-                print(f"\nTCP dropped: {addr[0]}:{addr[1]}", flush=True)
-        if dropped:
-            self._drop(dropped)
+            chunks = [first]
+            while len(chunks) < TCP_SEND_BATCH:
+                try:
+                    chunks.append(self._outgoing.get_nowait())
+                except queue.Empty:
+                    break
+            payload = b"".join(chunks)
+            with self._lock:
+                clients = list(self._clients.items())
+            dropped: list[socket.socket] = []
+            for conn, addr in clients:
+                try:
+                    conn.sendall(payload)
+                except OSError:
+                    dropped.append(conn)
+                    print(f"\nTCP dropped: {addr[0]}:{addr[1]}", flush=True)
+            if dropped:
+                self._drop(dropped)
 
     def _drop(self, sockets: list[socket.socket]) -> None:
         with self._lock:
@@ -360,9 +386,12 @@ class TcpHub:
             self._clients.clear()
         for conn in clients:
             close_tcp_socket(conn)
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+        if self._accept_thread is not None:
+            self._accept_thread.join(timeout=1.0)
+            self._accept_thread = None
+        if self._send_thread is not None:
+            self._send_thread.join(timeout=1.0)
+            self._send_thread = None
 
 
 class BonjourAdvertiser:
@@ -781,6 +810,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         lan_ip = local_ipv4()
         print(f"TCP:    {args.tcp_host}:{args.tcp_port} (LAN {lan_ip}:{args.tcp_port})")
+        print(f"        Máy khác: python plot_emg.py --host {lan_ip}")
         tcp_hub.start()
         bonjour = BonjourAdvertiser(args.tcp_port)
         print(f"Bonjour:{bonjour.start()}")

@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import re
+import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +32,125 @@ PACKET_SIZE = PACKET_STRUCT.size
 HEADER_BYTES = struct.pack("<H", PACKET_HEADER)
 DEFAULT_TCP_PORT = 8765
 TIMESTAMP_WRAP = 1 << 32
+BONJOUR_SERVICE_NAME = "SparkFun MyoWare EMG"
+BONJOUR_SERVICE_TYPE = "_sparkfun-emg._tcp"
+
+
+def port_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_ipv4(host: str, port: int) -> str | None:
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    if not infos:
+        return None
+    return infos[0][4][0]
+
+
+def discover_bonjour_endpoint(timeout: float = 2.5) -> tuple[str, int] | None:
+    if sys.platform == "darwin":
+        found = _discover_dns_sd(timeout)
+        if found:
+            return found
+    return _discover_zeroconf(timeout)
+
+
+def _discover_dns_sd(timeout: float) -> tuple[str, int] | None:
+    try:
+        proc = subprocess.Popen(
+            [
+                "dns-sd",
+                "-L",
+                BONJOUR_SERVICE_NAME,
+                BONJOUR_SERVICE_TYPE,
+                "local.",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    buf = ""
+    try:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            ready, _, _ = select.select([fd], [], [], max(remaining, 0.0))
+            if not ready:
+                break
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+            match = re.search(r"can be reached at\s+(\S+):(\d+)", buf)
+            if match:
+                host = match.group(1).rstrip(".")
+                port = int(match.group(2))
+                ip = _resolve_ipv4(host, port)
+                return (ip or host, port)
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    return None
+
+
+def _discover_zeroconf(timeout: float) -> tuple[str, int] | None:
+    try:
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    except ImportError:
+        return None
+
+    found: list[tuple[str, int]] = []
+
+    class Listener(ServiceListener):
+        def add_service(self, zc: object, type_: str, name: str) -> None:
+            info = zc.get_service_info(type_, name)  # type: ignore[attr-defined]
+            if info is None or not info.parsed_addresses():
+                return
+            found.append((info.parsed_addresses()[0], info.port))
+
+        def remove_service(self, zc: object, type_: str, name: str) -> None:
+            return
+
+        def update_service(self, zc: object, type_: str, name: str) -> None:
+            return
+
+    zeroconf = Zeroconf()
+    try:
+        ServiceBrowser(zeroconf, f"{BONJOUR_SERVICE_TYPE}.local.", Listener())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not found:
+            time.sleep(0.1)
+    finally:
+        zeroconf.close()
+    return found[0] if found else None
+
+
+def resolve_collector(host: str | None, port: int) -> tuple[str, int]:
+    if host:
+        ip = _resolve_ipv4(host, port)
+        return (ip or host, port)
+    if port_open("127.0.0.1", port, 0.3):
+        return "127.0.0.1", port
+    discovered = discover_bonjour_endpoint()
+    if discovered:
+        return discovered
+    mdns_ip = _resolve_ipv4("sparkfun-emg.local", port)
+    if mdns_ip:
+        return mdns_ip, port
+    return "127.0.0.1", port
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -187,7 +310,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Vẽ EMG realtime từ TCP hub của collect_emg.py."
     )
-    parser.add_argument("--host", default="127.0.0.1", help="IP máy collector")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "IP máy collector, ví dụ 192.168.1.32. "
+            "Mặc định thử 127.0.0.1 rồi Bonjour trên LAN"
+        ),
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_TCP_PORT, help="Cổng TCP"
     )
@@ -212,30 +342,51 @@ def parse_args() -> argparse.Namespace:
 
 
 def receiver_loop(
-    host: str,
+    host: str | None,
     port: int,
     buffer: LiveBuffer,
     vref: float | None,
     stop: threading.Event,
     conn_state: dict[str, str],
 ) -> None:
+    last_target = ""
+    last_error_printed = ""
     while not stop.is_set():
+        target_host, target_port = resolve_collector(host, port)
+        endpoint = f"{target_host}:{target_port}"
         conn_state["status"] = "connecting"
+        conn_state["endpoint"] = endpoint
+        if endpoint != last_target:
+            print(f"Đang kết nối TCP {endpoint} ...", flush=True)
+            last_target = endpoint
         try:
-            sock = socket.create_connection((host, port), timeout=3.0)
-        except OSError:
+            sock = socket.create_connection((target_host, target_port), timeout=3.0)
+        except OSError as exc:
             conn_state["status"] = "reconnecting"
+            if last_error_printed != endpoint:
+                if host:
+                    print(f"Không kết nối được {endpoint}: {exc}", flush=True)
+                else:
+                    print(
+                        "Chưa thấy collector. Máy khác trên LAN hãy chạy: "
+                        "python plot_emg.py --host 192.168.1.32",
+                        flush=True,
+                    )
+                last_error_printed = endpoint
             stop.wait(1.0)
             continue
+        last_error_printed = ""
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
         sock.settimeout(0.2)
         parser = PacketParser()
         buffer.reset_timeline()
         conn_state["status"] = "connected"
+        print(f"TCP connected: {endpoint}", flush=True)
         try:
             while not stop.is_set():
                 try:
-                    chunk = sock.recv(4096)
+                    chunk = sock.recv(8192)
                 except TimeoutError:
                     continue
                 except OSError:
@@ -251,6 +402,7 @@ def receiver_loop(
                 pass
         if not stop.is_set():
             conn_state["status"] = "reconnecting"
+            print(f"TCP disconnected: {endpoint}; reconnecting...", flush=True)
             stop.wait(0.5)
 
 
@@ -264,7 +416,7 @@ def run(args: argparse.Namespace) -> int:
 
     buffer = LiveBuffer(args.window)
     stop = threading.Event()
-    conn_state = {"status": "connecting"}
+    conn_state = {"status": "connecting", "endpoint": f"{args.host or 'auto'}:{args.port}"}
     thread = threading.Thread(
         target=receiver_loop,
         args=(args.host, args.port, buffer, args.vref, stop, conn_state),
@@ -289,7 +441,7 @@ def run(args: argparse.Namespace) -> int:
     ax.set_ylim(0, 1200 if args.vref is None else args.vref * 1.2)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
-    ax.set_title(f"SparkFun MyoWare  {args.host}:{args.port}")
+    ax.set_title(f"SparkFun MyoWare  {args.host or 'auto-discover'}:{args.port}")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right", framealpha=0.85)
     fig.tight_layout()
@@ -319,8 +471,12 @@ def run(args: argparse.Namespace) -> int:
                 f"min {fmt_value(vmin)}   max {fmt_value(vmax)}   "
                 f"[{conn_state['status']}]"
             )
+            ax.set_title(f"SparkFun MyoWare  {conn_state.get('endpoint', '')}")
         else:
-            status.set_text(f"TCP {conn_state['status']}   {args.host}:{args.port}")
+            status.set_text(
+                f"TCP {conn_state['status']}   "
+                f"{conn_state.get('endpoint', f'{args.host}:{args.port}')}"
+            )
         return raw_line, env_line, status
 
     _anim = FuncAnimation(
