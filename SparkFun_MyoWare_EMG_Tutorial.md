@@ -21,6 +21,80 @@ Thiết bị cùng mạng LAN có thể nhận data qua TCP, không cần cài L
 - macOS
 - USB-C
 
+## Định nghĩa
+
+### EMG
+
+Điện cơ (electromyography): điện thế khi cơ co. Surface EMG thường mạnh nhất khoảng
+10–500 Hz, biên độ thô trước khuếch đại cỡ µV–mV.
+
+### ADC count
+
+Giá trị `analogRead(A0)` trên RedBoard, ADC 10-bit nên miền **0…1023**. Đây là
+đơn vị mặc định trong `raw.bin` và trục Y của `plot_emg.py`. Không phải Volt.
+
+```text
+V = emg * Vref / 1023
+```
+
+`Vref` là 5 V hoặc 3.3 V tùy công tắc I/O. Plot Volt: `python plot_emg.py --vref 5`.
+
+### RAW, RECT, ENV (chân MyoWare)
+
+MyoWare 2.0 có ba lối analog. Firmware tutorial đọc **một** chân qua `EMG_PIN`
+(thường A0 / shield SIG):
+
+| Chân | Tín hiệu | Băng thông gần đúng | Ghi chú |
+| ---- | -------- | ------------------- | ------- |
+| RAW  | EMG hai cực, khuếch đại ~200× | ~20–500 Hz | Nghỉ quanh `Vref/2` (ADC ~512) |
+| RECT | RAW đã chỉnh lưu toàn sóng | vẫn nhanh | Chưa làm mượt |
+| ENV  | Envelope: chỉnh lưu + lọc ~3.6 Hz | rất chậm | 0…Vcc; nghỉ gần 0, co cơ tăng |
+
+ENV là envelope **phần cứng**. Không nhầm với đường RMS trên plot (xem dưới).
+
+### Nyquist và 1000 Hz
+
+Tần số lấy mẫu phải ≥ 2× tần số cao nhất của tín hiệu. RAW tới ~500 Hz nên
+**1000 Hz là mức tối thiểu**. ENV đã lọc 3.6 Hz nên 100–200 Hz đã đủ; firmware
+vẫn khóa 1000 Hz cho an toàn cả hai chế độ và còn headroom UART 230400 baud.
+
+### RMS (đường đỏ trên `plot_emg.py`)
+
+**Root Mean Square** — biên độ hiệu dụng, tính **trên máy plot**, không gửi từ
+board, không ghi vào `raw.bin`.
+
+Với cửa sổ trượt khoảng **80 ms** (`N ≈ sample_rate × 0.08`):
+
+```text
+RMS[i] = sqrt( (1/N) * sum_{k=i-N+1..i}  x[k]^2 )
+```
+
+`x[k]` là mẫu đang vẽ (ADC count, hoặc Volt nếu `--vref`).
+
+| Đường trên plot | Ý nghĩa |
+| --------------- | ------- |
+| raw (xanh nhạt) | Từng mẫu ADC; dao động nhanh nên dễ thành “khối” |
+| RMS (đỏ)        | Biên độ trung bình trượt; nghỉ thấp / co cơ nhô |
+
+RMS **không** phải chân ENV. Khác biệt:
+
+- ENV: analog trên MyoWare, lọc ~3.6 Hz, đã có trong từng sample nếu A0 = ENV.
+- RMS: overlay ~80 ms trong `plot_emg.py` (`rolling_rms`), chỉ để nhìn realtime.
+
+Nếu A0 là ENV, RMS gần với biên độ đã làm mượt. Nếu A0 là RAW (quanh 512), RMS
+vẫn mang DC offset nên lúc nghỉ không về 0.
+
+### CRC16
+
+Checksum CRC-16/CCITT-FALSE trên packet trừ trường CRC. Sai CRC → collector
+bỏ packet, đếm `CRC errors`, rồi resync.
+
+### Packet loss
+
+`packet_id` trên firmware tăng 1 mỗi mẫu. Collector thấy khoảng nhảy ID thì
+cộng `Lost` và ghi `lost_intervals` vào `raw.bin.json` (`start_timestamp` /
+`end_timestamp`). Rút USB cũng là một khoảng `usb_disconnect`.
+
 ## Arduino Firmware (packet dây v1, 15 byte)
 
 Firmware lấy mẫu **cố định 1000 Hz** rồi gửi trên Serial `230400` baud.
@@ -256,6 +330,10 @@ Nếu macOS hỏi quyền mạng, cho phép Python nhận kết nối đến.
 
 Không vẽ trong `collect_emg.py` để vòng USB không bị chậm. `plot_emg.py` là
 client TCP riêng: nhận packet v2, giữ cửa sổ trượt 5 giây, refresh ~30 FPS.
+
+Hai đường: **raw** (xanh, từng mẫu ADC) và **RMS** (đỏ, biên độ trượt ~80 ms).
+Định nghĩa RMS, ADC, RAW/ENV nằm ở mục [Định nghĩa](#định-nghĩa). Máy khác trên
+LAN phải truyền `--host <IP_collector>` (mặc định là `127.0.0.1`).
 
 Cùng máy với collector:
 
