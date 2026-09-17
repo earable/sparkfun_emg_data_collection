@@ -356,6 +356,59 @@ python plot_emg.py --vref 5
 Trục Y mặc định là ADC count `0..1023`. Trục X là thời gian tương đối (giây),
 0 ở mép phải (mẫu mới nhất).
 
+## Tín hiệu không đổi khi co cơ
+
+Collector/plot chạy được nghĩa là USB ổn. Nếu co cơ mà đường vẽ gần như đứng yên
+thì gần như chắc là **cảm biến / gain / điện cực / chân đọc**, không phải TCP.
+
+Session `data/session01/raw.bin` điển hình của lỗi này: hầu hết mẫu nằm
+**930–932 ADC**, `max |delta|` giữa hai mẫu liên tiếp chỉ **1**. Đó là đường
+thẳng, không phải EMG.
+
+### ENV tốt trông như thế nào
+
+Muốn “thấy co cơ” thì jumper/output shield phải là **ENV** (mặc định MyoWare):
+
+| Trạng thái | ADC (ENV) khoảng |
+| ---------- | ---------------- |
+| Nghỉ, cơ thả | thấp, ~50–250 |
+| Co vừa | tăng rõ, vài trăm |
+| Co mạnh | cao nhưng **không dính trần 1023** |
+
+Nếu nghỉ đã ~900–1023: **gain quá lớn**, co hay thả đều bão hòa nên plot không đổi.
+
+### Việc nên làm theo thứ tự
+
+1. **LED trên MyoWare 2.0**  
+   - LED **VIN**: sáng cố định khi công tắc ON (có nguồn).  
+   - LED **ENV** (vàng/amber): sáng khi chân ENV đủ cao, tức co cơ.  
+   Co cơ mà ENV lúc nháy lúc không thường là **điện cực/da/REF tiếp xúc kém**,
+   hoặc biên độ đúng ngưỡng LED — chỉnh pad trước, chưa vặn GAIN.
+   ENV nháy lúc không dán pad là bình thường (input floating).
+2. **Ba điện cực**  
+   MID và END dọc thớ cơ (cách nhau vài cm), **REF trên xương** (khuỷu, mắt cá),
+   không đặt REF trên cùng bụng cơ. Dùng điện cực gel mới, lau da.
+3. **Chiết áp GAIN** (chỉ chỉnh ENV; RAW/RECT cố định ×200)  
+   Nằm trên **board cảm biến** (không phải RedBoard), góc trên-trái, chữ
+   **GAIN**. Stack shield (Cable/Link/Power) che mất chiết áp — tháo shield
+   trên cùng mới vặn được. Tua vít Phillips nhỏ, nhẹ tay, không vặn quá cứng.  
+   - **Ngược chiều kim đồng hồ** = giảm gain.  
+   - **Cùng chiều kim đồng hồ** = tăng gain.  
+   Giảm đến khi nghỉ thấp (~50–250 ADC); co cơ RMS đỏ nhô, raw không dính 1023.
+4. **Đúng chân analog**  
+   Firmware đọc `A0`. Shield/Link: jumper **ENV** (không phải RAW) nếu mục tiêu
+   là thấy mức co. RAW dao động quanh ~512, biên độ nhỏ, RMS không về 0 — trông
+   như “không đổi” nếu nhìn cả thang 0–1023.
+5. **Nguồn và công tắc**  
+   MyoWare 2.0 cần Power Shield / nguồn đúng; công tắc board ON. RedBoard I/O
+   5 V hoặc 3.3 V phải khớp `Vref` nếu plot `--vref`.
+6. **Đối chiếu số**  
+   `python print_raw.py data/session01/raw.bin --seconds 5`  
+   Cột `emg` phải thay đổi hàng chục–hàng trăm khi xen kẽ nghỉ/co. Đứng ~930
+   như file cũ là chưa có EMG.
+
+RAW chỉ cần khi phân tích phổ; quan sát co cơ realtime dùng ENV + RMS trên plot.
+
 ## In dữ liệu text
 
 In 10 giây đầu và 10 giây cuối của `raw.bin` (cũng dùng được với
